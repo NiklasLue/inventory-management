@@ -79,6 +79,9 @@
                 <th>{{ t('demand.table.itemName') }}</th>
                 <th>{{ t('demand.table.currentDemand') }}</th>
                 <th>{{ t('demand.table.forecastedDemand') }}</th>
+                <th>{{ t('demand.table.onHand') }}</th>
+                <th>{{ t('demand.table.reorderPoint') }}</th>
+                <th>{{ t('demand.table.shortfall') }}</th>
                 <th>{{ t('demand.table.change') }}</th>
                 <th>{{ t('demand.table.trend') }}</th>
                 <th>{{ t('demand.table.period') }}</th>
@@ -90,6 +93,11 @@
                 <td>{{ forecast.item_name }}</td>
                 <td>{{ forecast.current_demand }}</td>
                 <td><strong>{{ forecast.forecasted_demand }}</strong></td>
+                <td>{{ inventoryBySku.get(forecast.item_sku)?.quantity_on_hand ?? '—' }}</td>
+                <td>{{ inventoryBySku.get(forecast.item_sku)?.reorder_point ?? '—' }}</td>
+                <td :class="{ 'shortfall-positive': getShortfall(forecast) > 0 }">
+                  {{ getShortfall(forecast) === null ? '—' : getShortfall(forecast) }}
+                </td>
                 <td>
                   <span :style="{ color: getChangeColor(forecast) }">
                     {{ getChangePercent(forecast) }}%
@@ -138,6 +146,16 @@ export default {
       const validSkus = new Set(inventoryItems.value.map(item => item.sku))
       return allForecasts.value.filter(f => validSkus.has(f.item_sku))
     })
+
+    // O(1) SKU lookup for the table — rebuilt only when inventoryItems changes.
+    const inventoryBySku = computed(() => new Map(inventoryItems.value.map(i => [i.sku, i])))
+
+    // Returns null when no matching inventory record exists so the template can show "—".
+    const getShortfall = (forecast) => {
+      const inv = inventoryBySku.value.get(forecast.item_sku)
+      if (!inv) return null
+      return Math.max(0, forecast.forecasted_demand - inv.quantity_on_hand)
+    }
 
     const loadForecasts = async () => {
       try {
@@ -214,6 +232,8 @@ export default {
       loading,
       error,
       forecasts,
+      inventoryBySku,
+      getShortfall,
       getForecastsByTrend,
       getChangePercent,
       getChangeColor,
@@ -365,5 +385,10 @@ export default {
   font-style: italic;
   text-align: center;
   padding: 0.5rem;
+}
+
+.shortfall-positive {
+  color: #dc2626;
+  font-weight: 600;
 }
 </style>

@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
@@ -13,6 +14,16 @@ QUARTER_MAP = {
     'Q3-2025': ['2025-07', '2025-08', '2025-09'],
     'Q4-2025': ['2025-10', '2025-11', '2025-12']
 }
+
+# Supplier lead times per product category; restocking POs derive expected
+# delivery from the longest lead time across the order's line items.
+CATEGORY_LEAD_TIME_DAYS = {
+    'Circuit Boards': 14,
+    'Sensors': 7,
+    'Actuators': 10,
+    'Controllers': 21,
+}
+DEFAULT_LEAD_TIME_DAYS = 14
 
 def filter_by_month(items: list, month: Optional[str]) -> list:
     """Filter items by month/quarter based on order_date field"""
@@ -119,6 +130,35 @@ class CreatePurchaseOrderRequest(BaseModel):
     unit_cost: float
     expected_delivery_date: str
     notes: Optional[str] = None
+
+class RestockingRecommendation(BaseModel):
+    item_sku: str
+    item_name: str
+    category: str
+    warehouse: str
+    unit_cost: float
+    current_stock: int
+    forecasted_demand: int
+    shortfall: int
+    suggested_qty: int
+    line_total: float
+
+class RestockingResponse(BaseModel):
+    recommendations: List[RestockingRecommendation]
+    budget_total: float
+    budget_used: float
+    item_count: int
+
+class RestockingOrderLine(BaseModel):
+    item_sku: str
+    item_name: str
+    quantity: int
+    unit_cost: float
+    category: str
+    warehouse: str
+
+class CreateRestockingOrderRequest(BaseModel):
+    items: List[RestockingOrderLine]
 
 # API endpoints
 @app.get("/")
@@ -303,6 +343,133 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+@app.get("/api/restocking/recommendations", response_model=RestockingResponse)
+def get_restocking_recommendations(budget: float):
+    """Recommend items to restock that fit within the given budget.
+
+    Joins demand forecasts with inventory by SKU, computes the forecast
+    shortfall (forecasted_demand - quantity_on_hand), and greedy-fills the
+    budget prioritising the items with the largest financial gap first.
+    """
+    if budget <= 0:
+        raise HTTPException(status_code=400, detail="budget must be greater than 0")
+
+    inventory_by_sku = {item["sku"]: item for item in inventory_items}
+
+    # Build candidate list: forecasts that have matching inventory AND a positive shortfall.
+    candidates = []
+    for forecast in demand_forecasts:
+        inv = inventory_by_sku.get(forecast["item_sku"])
+        if inv is None:
+            continue
+        shortfall = max(0, forecast["forecasted_demand"] - inv["quantity_on_hand"])
+        if shortfall <= 0:
+            continue
+        candidates.append({
+            "item_sku": forecast["item_sku"],
+            "item_name": forecast["item_name"],
+            "category": inv["category"],
+            "warehouse": inv["warehouse"],
+            "unit_cost": inv["unit_cost"],
+            "current_stock": inv["quantity_on_hand"],
+            "forecasted_demand": forecast["forecasted_demand"],
+            "shortfall": shortfall,
+        })
+
+    # Sort by financial size of the gap so the most impactful restocks come first.
+    candidates.sort(key=lambda c: c["shortfall"] * c["unit_cost"], reverse=True)
+
+    # Greedy fill: for each candidate, take as many units as the remaining budget allows
+    # up to the shortfall, then move on. Skip items the budget can't afford even one of.
+    remaining = budget
+    recommendations = []
+    for c in candidates:
+        if c["unit_cost"] <= 0:
+            continue
+        affordable = int(remaining // c["unit_cost"])
+        qty = min(c["shortfall"], affordable)
+        if qty <= 0:
+            continue
+        line_total = round(qty * c["unit_cost"], 2)
+        recommendations.append(RestockingRecommendation(
+            item_sku=c["item_sku"],
+            item_name=c["item_name"],
+            category=c["category"],
+            warehouse=c["warehouse"],
+            unit_cost=c["unit_cost"],
+            current_stock=c["current_stock"],
+            forecasted_demand=c["forecasted_demand"],
+            shortfall=c["shortfall"],
+            suggested_qty=qty,
+            line_total=line_total,
+        ))
+        remaining -= line_total
+
+    budget_used = round(budget - remaining, 2)
+    return RestockingResponse(
+        recommendations=recommendations,
+        budget_total=budget,
+        budget_used=budget_used,
+        item_count=len(recommendations),
+    )
+
+@app.post("/api/restocking/orders", response_model=Order)
+def create_restocking_order(payload: CreateRestockingOrderRequest):
+    """Submit a restocking order. Appends a new Order to the in-memory list
+    with status 'Submitted' and an expected delivery derived from the longest
+    category lead time across the order's items."""
+    if not payload.items:
+        raise HTTPException(status_code=400, detail="items must not be empty")
+
+    # Use the longest lead time across the order's categories so the
+    # expected_delivery promise covers the slowest line.
+    lead_days = max(
+        (CATEGORY_LEAD_TIME_DAYS.get(line.category, DEFAULT_LEAD_TIME_DAYS) for line in payload.items),
+        default=DEFAULT_LEAD_TIME_DAYS,
+    )
+
+    now = datetime.now()
+    warehouses = {line.warehouse for line in payload.items}
+    categories = {line.category for line in payload.items}
+
+    # Numeric ids in orders.json may be sparse; fall back gracefully if any are non-numeric.
+    def _id_as_int(o):
+        try:
+            return int(o["id"])
+        except (TypeError, ValueError):
+            return 0
+    next_id = max((_id_as_int(o) for o in orders), default=0) + 1
+
+    # Sequence the order_number within the RST- prefix family so submissions are easy to spot.
+    rst_seq = sum(1 for o in orders if str(o.get("order_number", "")).startswith("RST-")) + 1
+
+    total_value = round(sum(line.quantity * line.unit_cost for line in payload.items), 2)
+
+    new_order = {
+        "id": str(next_id),
+        "order_number": f"RST-{now.year}-{rst_seq:04d}",
+        "customer": "Internal Restocking",
+        "items": [
+            {
+                "name": line.item_name,
+                "sku": line.item_sku,
+                "quantity": line.quantity,
+                "unit_price": line.unit_cost,
+            }
+            for line in payload.items
+        ],
+        "status": "Submitted",
+        "order_date": now.isoformat(timespec="seconds"),
+        "expected_delivery": (now + timedelta(days=lead_days)).isoformat(timespec="seconds"),
+        "total_value": total_value,
+        "actual_delivery": None,
+        "warehouse": next(iter(warehouses)) if len(warehouses) == 1 else "Mixed",
+        "category": next(iter(categories)) if len(categories) == 1 else "Mixed",
+    }
+
+    orders.append(new_order)
+    return new_order
 
 if __name__ == "__main__":
     import uvicorn
